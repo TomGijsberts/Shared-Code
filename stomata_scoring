@@ -1,0 +1,216 @@
+import os
+import tkinter as tk
+from tkinter import simpledialog, messagebox, Tk
+import pandas as pd
+import datetime
+import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw, ImageFont
+import random
+import re
+
+version = "12-feb-2025-09:34"
+root = tk.Tk()
+root.withdraw()  # Hide the root window
+
+# This is only if packagaing it as .exe:
+# ensure you have pyinstaller installed:
+# in the pycharm script, go to terminal > command prompts and type: pip install pyinstaller, hit enter
+# pyinstaller --onefile your_script_name.py
+# for this file: pyinstaller --onefile main.py
+
+def get_classification(filename, image):
+    plt.figure(figsize=(6, 6))
+    plt.imshow(image)
+    plt.axis("off")
+    plt.show(block=False)  # Non-blocking show
+    plt.pause(0.1)  # Pause to allow the plot to update
+
+    # Create a hidden root window for the dialog
+    root = Tk()
+    root.withdraw()  # Hide the root window
+
+    while True:
+        label = simpledialog.askstring(
+            "Classification",
+            f"Classify {filename}:\n"
+            "(o/1 = open, c/3 = closed, n/2 = nearly closed, u/0 = unclear)"
+        )
+        if label is None:  # User pressed "x" or closed the dialog
+            plt.close()  # Close the image window
+            print("User closed the input dialog. Exiting program.")
+            return None
+        if label:
+            # Map numeric inputs to their corresponding keys
+            label_mapping = {
+                "1": "o",  # 1 is equivalent to 'o'
+                "2": "n",  # 2 is equivalent to 'n'
+                "3": "c",  # 3 is equivalent to 'c'
+                "0": "u",  # 0 is equivalent to 'u'
+            }
+            # Convert the input to lowercase and check if it's a numeric key
+            label = label.lower()
+            label = label_mapping.get(label, label)  # Use the mapped value if it exists, otherwise use the original input
+
+            # Get the classification based on the mapped or original input
+            classification = {"o": "open", "n": "nearly closed", "c": "closed", "u": "unclear"}.get(label)
+            if classification:
+                plt.close()  # Close image window on valid input
+                root.destroy()  # Close the hidden root window
+                return classification
+
+def open_image(image_path):
+    image = Image.open(image_path)
+    plt.imshow(image)
+    plt.axis("off")
+    plt.show()
+
+def crop_middle(image, division=10):
+    width, height = image.size
+    crop_size = int((height ** 2) / division) ** 0.5
+
+    left = (width - crop_size) // 2
+    top = (height - crop_size) // 2
+    right = left + crop_size
+    bottom = top + crop_size
+
+    return image.crop((left, top, right, bottom)), (left, top, right, bottom)
+
+def draw_overlay(image, crop_box):
+    overlay = image.copy()
+    draw = ImageDraw.Draw(overlay)
+    draw.rectangle(crop_box, outline="red", width=3)
+    return overlay
+
+def annotate_image(image, text):
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.truetype("arial.ttf", 30)  # Larger font size
+    draw.text((10, 10), text, fill="red", font=font)
+    return image
+
+def crop_image(raw_folder, cropped_folder, image):
+    # takes a random input image and crops it
+
+    # checks if the output folder exists, if not makes one
+    os.makedirs(cropped_folder, exist_ok=True)
+
+    raw_path = os.path.join(raw_folder, image)
+    cropped_filename = f"cropped_{image}"  # Add "cropped_" prefix
+    cropped_path = os.path.join(cropped_folder, cropped_filename)
+
+    if os.path.exists(cropped_path):
+        # print(f"{cropped_filename} already cropped and present in cropped_images, skipping")
+        return
+
+    raw_image = Image.open(raw_path)
+    cropped_image, _ = crop_middle(raw_image)
+    cropped_image.save(cropped_path)
+    print(f"Cropped and saved: {cropped_filename}")
+    return
+
+def analyze_image(cropped_folder, analyzed_folder, csv_path, image):
+    os.makedirs(analyzed_folder, exist_ok=True)
+
+    # checks if there is an existing csv, opens if there is
+    try:
+        df = pd.read_csv(csv_path)
+    except FileNotFoundError:
+        df = pd.DataFrame(columns=["filename", "timestamp", "relative_humidity_days", "treatment", "timepoint", "plant", "imprint", "stomata", "classification"])
+        # change this to include more info extracted from the filename
+
+    existing_files = set(df["filename"])
+
+    filename = image
+    if filename in existing_files:
+        # print(f"{filename} already in stomata_scoring.csv, skipping")
+        return
+    cropped_filename = f"cropped_{filename}"
+    cropped_image_path = os.path.join(cropped_folder, cropped_filename)
+    cropped_image = Image.open(cropped_image_path)
+    classification = get_classification(filename, cropped_image)
+    if classification is None:
+        print(f"User closed classification for {filename}, exit without save.")
+        exit()
+        return
+
+    # TODO: extract the data from the filenames. needs a good setup tough!
+    # for the real experiment:
+    # E3_ST_B(batch_number)_rhd(days with high rh)_(aba/water)_(spray/nospray)_t(minutes)_plant(plant number)_imprint(imprint number)
+    if "_aba_" in filename:
+        treatment = "aba"
+    if "_water_" in filename:
+        treatment = "water"
+    relative_humidity_days = 0
+    timepoint = filename.split("_t")[1].split("_")[0]
+    plant = filename.split("_pl")[1].split("_")[0]
+    if "-" in filename:
+        imprint = filename.split("_imp")[1].split("-")[0]
+        stomata = filename.split("-")[1].split("_C")[0]
+    if "-" not in filename:
+        imprint = filename.split("_imp")[1].split("_C")[0]
+        stomata = "01"
+
+
+
+    print(f'relative_humidity_days" {relative_humidity_days}')
+    print(f'treatment" {treatment}')
+    print(f"timepoint: {timepoint}")
+    print(f"plant: {plant}")
+    print(f"imprint: {imprint}")
+    print(f"stomata: {stomata}")
+
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    df.loc[len(df)] = [filename, timestamp, relative_humidity_days, treatment, timepoint, plant, imprint, stomata, classification]
+
+    analyzed_filename = f"analysed_{classification}_{filename}"  # Add "analysed_" prefix
+    analyzed_path = os.path.join(analyzed_folder, analyzed_filename)
+    annotated_image = annotate_image(cropped_image.copy(), f"{filename}:\n{classification}")
+    annotated_image.save(analyzed_path)
+    print(f"Annotated and saved: {analyzed_filename}")
+
+    df.to_csv(csv_path, index=False)
+    return
+
+def process_random_image(raw_images_folder, cropped_images_folder, analyzed_images_folder, csv_file):
+    # Get a list of all files in the raw_images_folder
+    all_files = os.listdir(raw_images_folder)
+
+    # Filter out non-image files (e.g., only keep .jpg files)
+    image_files = [f for f in all_files if f.endswith(".jpg") and "ORG" not in f]
+
+    if not image_files:
+        print("No valid images found in the raw_images_folder.")
+        return
+
+    # Select a random image from the list
+    random_image = random.choice(image_files)
+
+    # Crop the random image
+    crop_image(raw_images_folder, cropped_images_folder, random_image)
+
+    # Analyze the random image
+    analyze_image(cropped_images_folder, analyzed_images_folder, csv_file, random_image)
+
+if __name__ == "__main__":
+    raw_images_folder = "raw_images"
+    cropped_images_folder = "cropped_images"
+    analyzed_images_folder = "analyzed_images"
+    csv_file = "stomata_scoring.csv"
+
+    os.makedirs(cropped_images_folder, exist_ok=True)
+    os.makedirs(analyzed_images_folder, exist_ok=True)
+
+    # Check if raw_images folder exists
+    if not os.path.exists(raw_images_folder):
+        os.makedirs(raw_images_folder)
+        messagebox.showinfo(
+            "No Images Found",
+            "No images found. Created 'raw_images' folder. Please put the images in this folder and restart the program."
+        )
+        exit()
+
+    while len(os.listdir(raw_images_folder)) > len(os.listdir(analyzed_images_folder)):
+        process_random_image(raw_images_folder, cropped_images_folder, analyzed_images_folder, csv_file)
+
+    if len(os.listdir(raw_images_folder)) == len(os.listdir(analyzed_images_folder)):
+        print(f"no more images to analyse")
+        exit()
