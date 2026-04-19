@@ -1,0 +1,366 @@
+import os
+import random
+import shutil
+import time
+from datetime import datetime
+
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader, random_split
+from torchvision import transforms, models
+from PIL import Image
+
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, classification_report
+
+version = "19-Apr-2026-11:15"
+# TODO: """
+#  Place all labelled training image in the all_images folder
+#  run pip uninstall torch torchvision torchaudio -y
+#  run pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121"""
+
+# checking CUDA:
+print("CUDA available:", torch.cuda.is_available())
+print("Torch CUDA version:", torch.version.cuda)
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+TRAIN_MODEL = True
+RUN_INFERENCE = False
+
+IMAGE_FOLDER = r"all_images"
+INFERENCE_FOLDER = "inference_images"
+TRAIN_PERCENT = 80
+
+BATCH_SIZE = 32
+EPOCHS = 5
+LR = 1e-4
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print("\n==============================")
+print("SCRIPT STARTED")
+print("==============================")
+print(f"Device detected: {DEVICE}")
+print(f"Training enabled: {TRAIN_MODEL}")
+print(f"Inference enabled: {RUN_INFERENCE}")
+print("==============================\n")
+
+
+# ============================================================
+# DATASET
+# ============================================================
+
+class SimpleImageDataset(Dataset):
+    def __init__(self, image_paths, labels, transform):
+        print(f"Initializing dataset with {len(image_paths)} images.")
+        self.image_paths = image_paths
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        img = Image.open(img_path).convert("RGB")
+        img = self.transform(img)
+        label = self.labels[idx]
+        return img, label
+
+
+# ============================================================
+# TRAINING
+# ============================================================
+
+if TRAIN_MODEL:
+
+    print("TRAINING MODE ENABLED")
+    print(f"Loading images from: {IMAGE_FOLDER}")
+
+    # ---------- Create run folder ----------
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_folder = f"run_{timestamp}"
+    os.makedirs(run_folder, exist_ok=True)
+    print(f"Created run folder: {run_folder}")
+
+    # ---------- Collect images ----------
+    image_files = [
+        f for f in os.listdir(IMAGE_FOLDER)
+        if f.lower().endswith((".jpg", ".png"))
+    ]
+
+    print(f"Found {len(image_files)} image files.")
+
+    image_paths = []
+    class_names = []
+
+    for fname in image_files:
+        if "_E3" not in fname:
+            continue
+
+        label = fname.split("_E3")[0].strip()
+
+        if label.lower() == "unclear":
+            print(f"Skipping 'unclear' image: {fname}")
+            continue
+
+        image_paths.append(os.path.join(IMAGE_FOLDER, fname))
+        class_names.append(label)
+
+    print(f"Valid labeled images: {len(image_paths)}")
+
+    if len(image_paths) == 0:
+        print("ERROR: No valid training images found.")
+        exit()
+
+    label_encoder = LabelEncoder()
+    labels_encoded = label_encoder.fit_transform(class_names)
+
+    print(f"Classes detected ({len(label_encoder.classes_)}):")
+    for c in label_encoder.classes_:
+        print(f"  - {c}")
+
+    # Save label order
+    with open(os.path.join(run_folder, "label_order.txt"), "w") as f:
+        for name in label_encoder.classes_:
+            f.write(name + "\n")
+    print("Saved label order.")
+
+    # ---------- Dataset overview ----------
+    df_overview = pd.DataFrame({
+        "image_path": image_paths,
+        "class_name": class_names
+    })
+    df_overview.to_csv(os.path.join(run_folder, "dataset_overview.csv"), index=False)
+    print("Saved dataset overview CSV.")
+
+    # ---------- Transforms ----------
+    print("Preparing image transforms...")
+
+    train_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225])
+    ])
+
+    val_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225])
+    ])
+
+    # ---------- Dataset ----------
+    indices = list(range(len(image_paths)))
+    random.shuffle(indices)
+
+    train_size = int(TRAIN_PERCENT / 100 * len(indices))
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size:]
+
+    print(f"Splitting dataset: {len(train_indices)} train / {len(val_indices)} validation")
+
+    train_dataset = SimpleImageDataset(
+        [image_paths[i] for i in train_indices],
+        [labels_encoded[i] for i in train_indices],
+        train_transform
+    )
+
+    val_dataset = SimpleImageDataset(
+        [image_paths[i] for i in val_indices],
+        [labels_encoded[i] for i in val_indices],
+        val_transform
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    print(f"Train batches per epoch: {len(train_loader)}")
+    print(f"Validation batches per epoch: {len(val_loader)}")
+
+    # ---------- Model ----------
+    print("Loading ResNet18 (pretrained weights may download if first run)...")
+
+    model = models.resnet18(weights="DEFAULT")
+    model.fc = nn.Linear(model.fc.in_features, len(label_encoder.classes_))
+    model = model.to(DEVICE)
+
+    print("Model ready.")
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
+
+    print("Optimizer and loss initialized.")
+
+    # ---------- Training ----------
+    train_losses = []
+    val_losses = []
+
+    print("\nStarting training loop...\n")
+
+    for epoch in range(EPOCHS):
+
+        print(f"\n===== EPOCH {epoch+1}/{EPOCHS} =====")
+        epoch_start = time.time()
+
+        model.train()
+        epoch_train_loss = 0
+
+        for batch_idx, (images, labels) in enumerate(train_loader):
+            images = images.to(DEVICE)
+            labels = labels.to(DEVICE)
+
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            epoch_train_loss += loss.item()
+
+            if batch_idx % 10 == 0:
+                print(f"  Batch {batch_idx+1}/{len(train_loader)} "
+                      f"Loss: {loss.item():.4f}")
+
+        epoch_train_loss /= len(train_loader)
+        train_losses.append(epoch_train_loss)
+
+        print(f"Epoch train loss: {epoch_train_loss:.4f}")
+
+        # ---------- Validation ----------
+        model.eval()
+        epoch_val_loss = 0
+        all_preds = []
+        all_targets = []
+
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images = images.to(DEVICE)
+                labels = labels.to(DEVICE)
+
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                epoch_val_loss += loss.item()
+
+                preds = outputs.argmax(dim=1)
+                all_preds.extend(preds.cpu().numpy())
+                all_targets.extend(labels.cpu().numpy())
+
+        epoch_val_loss /= len(val_loader)
+        val_losses.append(epoch_val_loss)
+
+        print(f"Validation loss: {epoch_val_loss:.4f}")
+
+        # ---------- Confusion matrix ----------
+        print("Saving confusion matrix...")
+        cm = confusion_matrix(all_targets, all_preds)
+        disp = ConfusionMatrixDisplay(cm, display_labels=label_encoder.classes_)
+        disp.plot(xticks_rotation=45)
+        plt.tight_layout()
+        plt.savefig(os.path.join(run_folder, f"val_confusion_epoch_{epoch+1}.png"))
+        plt.close()
+
+        # ---------- Classification report ----------
+        print("Saving classification report...")
+        report = classification_report(
+            all_targets,
+            all_preds,
+            target_names=label_encoder.classes_,
+            output_dict=True
+        )
+        pd.DataFrame(report).transpose().to_csv(
+            os.path.join(run_folder, f"val_report_epoch_{epoch+1}.csv")
+        )
+
+        epoch_time = time.time() - epoch_start
+        print(f"Epoch completed in {epoch_time:.1f} seconds")
+
+    # ---------- Loss curve ----------
+    print("Saving loss curve...")
+    plt.plot(train_losses, label="Train")
+    plt.plot(val_losses, label="Validation")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(run_folder, "loss_curve.png"))
+    plt.close()
+
+    # ---------- Save model ----------
+    torch.save(model.state_dict(), os.path.join(run_folder, "model.pt"))
+    print(f"Model saved to {run_folder}/model.pt")
+
+    print("\nTRAINING FINISHED.\n")
+
+
+# ============================================================
+# INFERENCE
+# ============================================================
+
+if RUN_INFERENCE:
+
+    print("INFERENCE MODE ENABLED")
+
+    run_folder = "COPY RUN FOLDER NAME"
+    model_path = os.path.join(run_folder, "model.pt")
+
+    print(f"Loading model from: {model_path}")
+
+    with open(os.path.join(run_folder, "label_order.txt")) as f:
+        class_names = [line.strip() for line in f]
+
+    model = models.resnet18(weights=None)
+    model.fc = nn.Linear(model.fc.in_features, len(class_names))
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    model = model.to(DEVICE)
+    model.eval()
+
+    print("Model loaded successfully.")
+
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225])
+    ])
+
+    results = []
+
+    files = os.listdir(INFERENCE_FOLDER)
+    print(f"Found {len(files)} files in inference folder.")
+
+    for fname in files:
+        if not fname.lower().endswith((".jpg", ".png")):
+            continue
+
+        print(f"Predicting: {fname}")
+
+        path = os.path.join(INFERENCE_FOLDER, fname)
+        img = Image.open(path).convert("RGB")
+        tensor = transform(img).unsqueeze(0).to(DEVICE)
+
+        with torch.no_grad():
+            output = model(tensor)
+            pred_idx = output.argmax(dim=1).item()
+            pred_label = class_names[pred_idx]
+
+            if pred_label.lower() == "unclear":
+                print("  → Prediction was 'unclear', skipping.")
+                continue
+
+        print(f"  → Predicted: {pred_label}")
+
+        results.append((fname, pred_label))
+
+    pd.DataFrame(results, columns=["filename", "predicted_class"]) \
+        .to_csv(os.path.join(run_folder, "predictions.csv"), index=False)
+
+    print("Inference complete.")
